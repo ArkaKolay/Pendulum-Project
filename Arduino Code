@@ -1,0 +1,180 @@
+#include <Arduino.h>
+#include <BasicEncoder.h>
+
+const int8_t pinA1 = 69;
+const int8_t pinB1 = 68;
+const int8_t pinA2 = 67;
+const int8_t pinB2 = 66;
+const int8_t pinM1 = 52;
+const int8_t pinM2 = 53;
+const int8_t pinMS = 2;
+bool stop_loop = false;
+
+BasicEncoder encoder1(pinA1, pinB1); //pendulum encoder
+BasicEncoder encoder2(pinA2, pinB2);  //motor encoder
+
+unsigned long lastTime = 0;
+float lastPosition1 = 0;
+float lastPosition2 = 0;
+float velocity1 = 0;
+float velocity2 = 0;
+const float interval = 1; // Time interval in milliseconds (1 second)
+
+const float alpha1 = 0.08; // Smoothing factor for velocity (0 < alpha < 1)
+const float alpha2 = 0.02; // Smoothing factor for velocity (0 < alpha < 1)
+float filteredVelocity1 = 0;
+float filteredVelocity2 = 0;
+
+float motors = 0;
+float kpp = 200.0; //proportional gain pendulum  //50.0
+float kip = 0.0; //integral gain pendulum  //0.0150
+float thetap = 0; //pendulum angle
+float intthetap = 0;  //pendulum integral angle
+float kpm = 40.0; //proportional gain motor //90.0
+float kim = 0.0; //motor integral gain //0.0070
+float thetam = 0; //motor angle
+float intthetam = 0;  //integral angle motor
+
+void pciSetup(byte pin)  // Setup pin change interupt on pin
+{
+  *digitalPinToPCMSK(pin) |= bit(digitalPinToPCMSKbit(pin));  // enable pin
+  PCIFR |= bit(digitalPinToPCICRbit(pin));                    // clear outstanding interrupt
+  PCICR |= bit(digitalPinToPCICRbit(pin));                    // enable interrupt for group
+}
+
+void setup_encoders(int a1, int b1, int a2, int b2) {
+  uint8_t old_sreg = SREG;     // save the current interrupt enable flag
+  noInterrupts();
+  pciSetup(a1);
+  pciSetup(b1);
+  pciSetup(a2);
+  pciSetup(b2);
+  encoder1.reset();
+  encoder2.reset();
+  SREG = old_sreg;    // restore the previous interrupt enable flag state
+}
+
+ISR(PCINT2_vect)  // pin change interrupt for D0 to D7
+{
+  encoder1.service();
+  encoder2.service();
+}
+
+void motor_stop() {
+    digitalWrite(pinM1, HIGH); 
+    digitalWrite(pinM2, HIGH); 
+    analogWrite(pinMS, 0); 
+}
+
+void setup() {
+  Serial.begin(115200);
+  Serial.println("Interrupts");
+  setup_encoders(pinA1,pinB1,pinA2,pinB2);
+  encoder1.set_reverse();
+  encoder2.set_reverse();
+  lastTime = micros(); // Initialize the timer
+  pinMode(pinM1, OUTPUT);   
+  pinMode(pinM2, OUTPUT);  
+  pinMode(pinMS, OUTPUT);  
+  motor_stop();
+  stop_loop = false;
+  intthetap = 0;
+  intthetam = 0;
+}
+
+void motor_cclockwise(uint8_t mspeed) {  //counter clockwise
+  digitalWrite(pinM1, HIGH); 
+  digitalWrite(pinM2, LOW); 
+  analogWrite(pinMS, mspeed);
+}
+
+void motor_clockwise(uint8_t mspeed) { //clockwise
+  digitalWrite(pinM1, LOW); 
+  digitalWrite(pinM2, HIGH); 
+  analogWrite(pinMS, mspeed);
+}
+
+
+void motor_rotate(int rspeed) {
+  if(rspeed < 0) {
+    motor_clockwise(-rspeed);
+  }
+  else if(rspeed > 0) {
+    motor_cclockwise(rspeed);
+  }
+  else {
+    motor_stop();
+  }
+}
+
+void loop() {
+ if(((float)(encoder2.get_count()*360/220) <= 60.0 && (float)(encoder2.get_count()*360/220) >= -60.0) && !stop_loop)
+  {
+    unsigned long currentTime = micros();
+  
+    // Check if the time interval has passed
+    if (currentTime - lastTime >= interval) {
+      // Read the current encoder positions
+      float currentPosition1 = encoder1.get_count(); // Position of encoder 1
+      float currentPosition2 = encoder2.get_count(); // Position of encoder 2
+      
+      // Calculate the change in position and time
+      float deltaPosition1 = currentPosition1 - lastPosition1;
+      float deltaPosition2 = currentPosition2 - lastPosition2;
+      float deltaTime = (currentTime - lastTime);
+      
+      // Calculate velocities (change in position over change in time)
+      velocity1 = (float)((deltaPosition1 / deltaTime)*(180000.0));
+      velocity2 = (float)((deltaPosition2 / deltaTime)*(18000000.0/11.0));
+  
+      filteredVelocity1 = alpha1 * velocity1 + (1 - alpha1) * filteredVelocity1;
+      filteredVelocity2 = alpha2 * velocity2 + (1 - alpha2) * filteredVelocity2;
+      
+      // Update lastPosition and lastTime for both encoders
+      lastPosition1 = currentPosition1;
+      lastPosition2 = currentPosition2;
+      lastTime = currentTime;
+    }
+  
+    int encoder1_change = encoder1.get_change();
+    thetap = (float)encoder1.get_count()*360/2000;
+    int encoder2_change = encoder2.get_change();
+    thetam = (float)encoder2.get_count()*360/220;
+    if (encoder1_change || encoder2_change) {
+      Serial.print(thetap, 2);
+      Serial.print("\t");
+      Serial.print(filteredVelocity1);
+      Serial.print("\t");
+     // Serial.print(velocity1);
+      //Serial.print("\t");
+     Serial.print(thetam, 2);
+     //Serial.print(encoder2.get_count());
+      Serial.print("\t");
+      //Serial.print(velocity2);
+      //Serial.print("\t");
+      Serial.print(filteredVelocity2);
+      Serial.println();
+    }
+
+    intthetap = intthetap + thetap;
+    int motorsp = -((int)(kpp*thetap) + (int)(kip*intthetap));
+    intthetam = intthetam + thetam;
+    int motorsm = -((int)(kpm*thetam) + (int)(kim*intthetam));
+    motors = motorsm+motorsp;
+    if(motors <= 255 && motors >= -255) {
+      motor_rotate(motors);
+    }
+    else if(motors > 255) {
+      motor_rotate(255);
+    }
+    else {
+      motor_rotate(-255);
+    }
+  }
+  else
+  {
+    motor_stop();
+    stop_loop = true;
+   // Serial.println("loop stopped");
+  }
+}
